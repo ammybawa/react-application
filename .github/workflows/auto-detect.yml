@@ -48,8 +48,12 @@ jobs:
               echo "node_deploy=pm2-server" >> "$GITHUB_OUTPUT"
             elif [ "$NODE_DEPLOY_MODE" = "static" ]; then
               echo "node_deploy=static" >> "$GITHUB_OUTPUT"
+            elif [ "$NODE_DEPLOY_MODE" = "build-folder" ]; then
+              echo "node_deploy=build-folder" >> "$GITHUB_OUTPUT"
             elif grep -qE '"vite"|"@vitejs/' package.json && grep -q 'vite build' package.json; then
               echo "node_deploy=static" >> "$GITHUB_OUTPUT"
+            elif grep -qE 'react-scripts|craco|react-app-rewired' package.json || grep -qE '"build".*react-scripts build' package.json; then
+              echo "node_deploy=build-folder" >> "$GITHUB_OUTPUT"
             else
               echo "node_deploy=pm2-server" >> "$GITHUB_OUTPUT"
             fi
@@ -157,22 +161,36 @@ jobs:
             echo "No @tailwindcss/oxide in tree, skipping rebuild"
           fi
 
-      - name: Run production build (static sites)
-        if: needs.detect.outputs.node_deploy == 'static'
+      - name: Run production build (Vite / CRA)
+        if: |
+          needs.detect.outputs.node_deploy == 'static' ||
+          needs.detect.outputs.node_deploy == 'build-folder'
         run: npm run build --if-present
 
       - name: Resolve build output directory
         id: outdir
-        if: needs.detect.outputs.node_deploy == 'static'
+        if: |
+          needs.detect.outputs.node_deploy == 'static' ||
+          needs.detect.outputs.node_deploy == 'build-folder'
         run: |
-          if [ -d dist ]; then echo "dir=dist" >> "$GITHUB_OUTPUT"
-          elif [ -d out ]; then echo "dir=out" >> "$GITHUB_OUTPUT"
-          elif [ -d build ]; then echo "dir=build" >> "$GITHUB_OUTPUT"
-          else echo "dir=." >> "$GITHUB_OUTPUT"
+          if [ "${{ needs.detect.outputs.node_deploy }}" = "build-folder" ]; then
+            if [ ! -d build ]; then
+              echo "::error::Expected build/ after npm run build (Create React App style). See NODE_DEPLOY_MODE."
+              exit 1
+            fi
+            echo "dir=build" >> "$GITHUB_OUTPUT"
+          else
+            if [ -d dist ]; then echo "dir=dist" >> "$GITHUB_OUTPUT"
+            elif [ -d out ]; then echo "dir=out" >> "$GITHUB_OUTPUT"
+            elif [ -d build ]; then echo "dir=build" >> "$GITHUB_OUTPUT"
+            else echo "dir=." >> "$GITHUB_OUTPUT"
+            fi
           fi
 
       - name: Upload static build artifact
-        if: needs.detect.outputs.node_deploy == 'static'
+        if: |
+          needs.detect.outputs.node_deploy == 'static' ||
+          needs.detect.outputs.node_deploy == 'build-folder'
         uses: actions/upload-artifact@v4
         with:
           name: node-build
@@ -282,8 +300,26 @@ jobs:
             exit 1
           fi
 
-      - name: Copy files to server (Node / HTML static)
-        if: needs.detect.outputs.node == 'true' || needs.detect.outputs.html == 'true'
+      - name: Copy React/Web build output only (nginx → project/build)
+        if: needs.detect.outputs.node == 'true' && needs.detect.outputs.node_deploy == 'build-folder'
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          port: ${{ secrets.SSH_PORT != '' && secrets.SSH_PORT || '22' }}
+          timeout: 2m
+          command_timeout: 15m
+          source: "_artifact/*"
+          target: ${{ secrets.DEPLOY_BUILD_PATH != '' && secrets.DEPLOY_BUILD_PATH || format('{0}/build', secrets.DEPLOY_PATH) }}
+          strip_components: 1
+          rm: false
+          overwrite: true
+
+      - name: Copy files to server (Node static / Vite, PM2 source, or HTML)
+        if: |
+          (needs.detect.outputs.node == 'true' && needs.detect.outputs.node_deploy != 'build-folder') ||
+          (needs.detect.outputs.html == 'true' && needs.detect.outputs.node != 'true')
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -338,6 +374,10 @@ jobs:
             echo "=== Deployment ==="
             cd "${{ secrets.DEPLOY_PATH }}"
             ls -la
+
+            if [ "${{ needs.detect.outputs.node }}" = "true" ] && [ "${{ needs.detect.outputs.node_deploy }}" = "build-folder" ]; then
+              echo "Create React App / nginx: only build/ was updated; no server npm install or PM2."
+            fi
 
             if [ "${{ needs.detect.outputs.python }}" = "true" ] && [ "${{ needs.detect.outputs.node }}" != "true" ] && [ "${{ needs.detect.outputs.html }}" != "true" ]; then
               if [ -f requirements.txt ]; then
